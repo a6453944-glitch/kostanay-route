@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Костанай — умный маршрут</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+html,body,#map{height:100%;margin:0}
+body{font-family:Arial,sans-serif}
+.panel{position:absolute;z-index:1000;top:12px;left:12px;width:310px;background:#fff;padding:14px;border-radius:14px;box-shadow:0 3px 18px #0003}
+h2{margin:0 0 10px;font-size:19px}
+button{width:100%;margin:4px 0;padding:10px;border:0;border-radius:9px;font-weight:700;cursor:pointer}
+.primary{background:#1976d2;color:#fff}.danger{background:#d32f2f;color:#fff}.gray{background:#eee}
+#status{margin-top:9px;padding:9px;background:#f5f5f5;border-radius:9px;font-size:13px}
+.block-icon{font-size:25px;font-weight:bold}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+<h2>🚗 Умный маршрут — Костанай</h2>
+<button class="primary" id="route">Найти кратчайший маршрут</button>
+<button class="danger" id="block">🧱 Поставить перекрытие</button>
+<button class="gray" id="clear">Очистить всё</button>
+<div id="status">1) Выберите А.<br>2) Выберите Б.<br>3) Постройте маршрут.</div>
+<div id="closures" style="margin-top:9px;padding:9px;background:#fff3f3;border-radius:9px;font-size:13px"><b>🧱 Перекрытия</b><br><span id="closureList">Загрузка актуальных данных…</span></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map=L.map('map').setView([53.2144,63.6246],13);
+// Минималистичная белая карта: без цветных спутниковых/обычных тайлов.
+// Дороги и объекты поверх карты загружаются из OpenStreetMap.
+map.getContainer().style.background = '#fff';
+
+const roadLayer = L.layerGroup().addTo(map);
+const poiLayer = L.layerGroup().addTo(map);
+
+async function loadWhiteRoadMap(){
+  const q = `[out:json][timeout:25];
+  way["highway"](53.14,63.48,53.30,63.78);
+  out geom;`;
+  try{
+    const r = await fetch('https://overpass-api.de/api/interpreter?data='+encodeURIComponent(q));
+    const d = await r.json();
+    d.elements.forEach(w=>{
+      if(!w.geometry) return;
+      L.polyline(w.geometry.map(x=>[x.lat,x.lon]),{
+        color:'#000', weight:2, opacity:1, interactive:false
+      }).addTo(roadLayer);
+    });
+  }catch(e){
+    msg('⚠️ Не удалось загрузить дорожную сеть OSM. Проверьте интернет.');
+  }
+}
+loadWhiteRoadMap();
+
+let A=null,B=null,ma=null,mb=null,routeLayer=null,blockMode=false,blocks=[];
+
+// Актуальное на 8 сентября 2026 г. перекрытие:
+// перекрёсток Дощанова — Мауленова, действует 3–10 сентября 2026.
+// Координаты уточняются через Nominatim при загрузке.
+let activeClosures=[];
+let closureMarkers=[];
+
+const facilities = [
+  {type:'fire', name:'Пожарная часть №1', address:'ул. Гоголя, 79А, Костанай'},
+  {type:'fire', name:'Пожарная часть №5', address:'ул. Карбышева, 10/1, Костанай'},
+  {type:'hospital', name:'Городская больница', address:'пр-т Аль-Фараби, 146, Костанай'},
+  {type:'hospital', name:'Костанайская областная детская больница', address:'ул. Леонида Беды, 23А, Костанай'},
+  {type:'hospital', name:'Костанайская железнодорожная больница', address:'ул. Майлина, 81, Костанай'},
+  {type:'police', name:'Городской отдел внутренних дел', address:'ул. Тауелсиздик, 36, Костанай'},
+  {type:'police', name:'Департамент полиции Костанайской области', address:'ул. Баймагамбетова, 197, Костанай'},
+  {type:'police', name:'Южный отдел полиции', address:'ул. М. Хакимжановой, 58, Костанай'},
+  {type:'police', name:'Участковый пункт полиции «Дорожник»', address:'ул. Абая, 52, Костанай'},
+  {type:'police', name:'Участковый пункт полиции «Заводской»', address:'ул. Чехова, 107, Костанай'}
+];
+
+function poiIcon(type){
+ const color=type==='fire'?'#111':type==='hospital'?'#333':'#555';
+ const symbol=type==='fire'?'🔥':type==='hospital'?'✚':'★';
+ return L.divIcon({
+   className:'',
+   html:`<div title="${type}" style="width:25px;height:25px;border-radius:50%;background:white;border:2px solid ${color};color:${color};display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:bold;box-shadow:0 1px 4px #0005">${symbol}</div>`,
+   iconSize:[25,25],iconAnchor:[12,12]
+ });
+}
+
+async function geocode(q){
+ const r=await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=kz&q='+encodeURIComponent(q),{
+   headers:{'Accept-Language':'ru'}
+ });
+ const d=await r.json();
+ return d[0]?{lat:+d[0].lat,lon:+d[0].lon}:null;
+}
+
+async function loadFacilities(){
+ for(const f of facilities){
+   try{
+     const g=await geocode(f.address);
+     if(!g) continue;
+     L.marker([g.lat,g.lon],{icon:poiIcon(f.type)}).bindPopup(
+       `<b>${f.name}</b><br>${f.address}<br><br>${f.type==='fire'?'🚒 Пожарная часть':f.type==='hospital'?'🏥 Больница':'👮 Полиция'}`
+     ).addTo(poiLayer);
+   }catch(e){}
+ }
+}
+loadFacilities();
+
+async function loadClosures(){
+ try{
+   const g=await geocode('перекрёсток Дощанова и Мауленова, Костанай');
+   if(!g) return;
+   const lat=g.lat, lon=g.lon, s=.00035;
+   const c=L.polyline([[lat-s,lon-s*.35],[lat+s,lon+s*.35]],{
+     color:'#111',weight:11,opacity:1
+   }).addTo(poiLayer);
+   c.bindPopup('<b>🧱 Перекрытие</b><br>Дощанова × Мауленова<br>Действует 3–10 сентября 2026 г.<br><small>Источник: акимат Костаная</small>');
+   closureMarkers.push(c);
+   activeClosures.push({lat,lon,radius:0.0008,name:'Дощанова × Мауленова'}); document.getElementById('closureList').innerHTML='🔴 <b>Дощанова × Мауленова</b><br><small>Перекрытие: 3–10 сентября 2026</small>';
+ }catch(e){}
+}
+loadClosures();
+setInterval(()=>{ if(activeClosures.length===0) loadClosures(); },60000);
+
+function closeEnough(a,b){
+ const R=6371000, p=Math.PI/180;
+ const x=(b[1]-a[1])*p*Math.cos((a[0]+b[0])*p/2);
+ const y=(b[0]-a[0])*p;
+ return Math.sqrt(x*x+y*y)*R;
+}
+function routeHitsClosure(coords){
+ return activeClosures.some(c=>coords.some(pt=>closeEnough([c.lat,c.lon],[pt[1],pt[0]]) < c.radius*111000));
+}
+
+function msg(t){document.getElementById('status').innerHTML=t}
+function markerIcon(text,color){
+ return L.divIcon({className:'',html:`<div style="background:${color};color:white;width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:bold;border:3px solid white;box-shadow:0 1px 5px #000">${text}</div>`,iconSize:[36,36],iconAnchor:[18,18]})
+}
+map.on('click',e=>{
+ if(blockMode){ addBlock(e.latlng); return; }
+ if(!A){
+   A=e.latlng; ma=L.marker(A,{icon:markerIcon('A','#2e7d32')}).addTo(map);
+   msg('Пункт А выбран. Теперь выберите пункт Б.');
+ }else if(!B){
+   B=e.latlng; mb=L.marker(B,{icon:markerIcon('Б','#c62828')}).addTo(map);
+   msg('А и Б выбраны. Нажмите «Найти кратчайший маршрут».');
+ }else{
+   B=e.latlng; mb.setLatLng(B); clearRoute();
+   msg('Пункт Б изменён. Нажмите «Найти кратчайший маршрут».');
+ }
+});
+
+document.getElementById('block').onclick=()=>{
+ blockMode=!blockMode;
+ document.getElementById('block').textContent=blockMode?'❌ Выйти из режима перекрытия':'🧱 Поставить перекрытие';
+ msg(blockMode?'Режим перекрытия: нажимайте на карту возле дороги.':'Режим выбора А/Б.');
+};
+
+function addBlock(p){
+ const s=0.00018;
+ const b=L.polyline([[p.lat-s,p.lng-s*.35],[p.lat+s,p.lng+s*.35]],{color:'#111',weight:10}).addTo(map);
+ b.bindPopup('🧱 Перекрытие<br>Нажмите на него, чтобы удалить.');
+ b.on('click',e=>{L.DomEvent.stopPropagation(e);map.removeLayer(b);blocks=blocks.filter(x=>x!==b)});
+ blocks.push(b);
+ msg('Перекрытие установлено. В этой версии оно визуально отмечает закрытие; для полного исключения конкретного OSM-ребра нужен серверный граф.');
+}
+
+function clearRoute(){if(routeLayer){map.removeLayer(routeLayer);routeLayer=null}}
+document.getElementById('clear').onclick=()=>{
+ A=B=null; if(ma)map.removeLayer(ma);if(mb)map.removeLayer(mb);ma=mb=null;clearRoute();
+ blocks.forEach(b=>map.removeLayer(b));blocks=[];msg('Очищено. Выберите пункт А.');
+};
+
+/*
+ Для настоящей маршрутизации используем публичный OSRM:
+ браузер отправляет координаты A/B, OSRM использует дорожный граф
+ OpenStreetMap и возвращает маршрут по реальным дорогам.
+*/
+document.getElementById('route').onclick=async()=>{
+ if(!A||!B){msg('Сначала выберите А и Б.');return}
+ clearRoute();
+ msg('⏳ Строю маршрут по данным OpenStreetMap...');
+ const url=`https://router.project-osrm.org/route/v1/driving/${A.lng},${A.lat};${B.lng},${B.lat}?overview=full&geometries=geojson&steps=true&alternatives=true`;
+ try{
+   const r=await fetch(url); if(!r.ok)throw Error('OSRM');
+   const data=await r.json();
+   if(data.code!=='Ok'||!data.routes?.length)throw Error('no route');
+
+   // Выбираем самый короткий вариант, который не проходит через
+   // автоматически добавленное перекрытие.
+   let candidates=data.routes.filter(rt=>!routeHitsClosure(rt.geometry.coordinates));
+   if(!candidates.length){
+     candidates=data.routes;
+     msg('⚠️ OSRM не дал альтернативу без перекрытия; показан ближайший найденный маршрут.');
+   }
+   candidates.sort((a,b)=>a.distance-b.distance);
+   const rt=candidates[0];
+   routeLayer=L.geoJSON(rt.geometry,{style:{color:'#1565c0',weight:7,opacity:.9}}).addTo(map);
+   map.fitBounds(routeLayer.getBounds(),{padding:[70,70]});
+   msg(`✅ Маршрут найден по дорожной сети OpenStreetMap.<br><br>Расстояние: <b>${(rt.distance/1000).toFixed(2)} км</b><br>Время: <b>${Math.round(rt.duration/60)} мин</b>`);
+ }catch(e){
+   msg('❌ Не удалось получить маршрут. Проверьте интернет или повторите попытку.');
+ }
+};
+</script>
+</body>
+</html>
